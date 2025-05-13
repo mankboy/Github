@@ -1,0 +1,5 @@
+requests>=2.25.0
+python-docx>=0.8.11
+Pillow>=8.0.0
+configparser>=5.0.0
+google-generativeai>=0.1.0 
