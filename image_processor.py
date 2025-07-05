@@ -130,12 +130,21 @@ def get_rectangle(image, title):
             cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         except:
             pass  # Fallback to resizable window if fullscreen fails
-    
+
     cv2.setMouseCallback(window_name, draw_rectangle)
     cv2.imshow(window_name, current_image)
     
     # Ensure window is brought to front and activated
     cv2.waitKey(1)
+
+    # Attempt to bring the window to the front after it's definitely drawn
+    try:
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+        cv2.waitKey(1) # Allow time for property to apply
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 0)
+        print("Attempted to bring window to front.") # Debug message
+    except Exception as e:
+        print(f"Note: Could not set window property for bringing to front: {e}")
     
     while True:
         cv2.imshow(window_name, current_image)

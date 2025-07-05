@@ -1,3 +1,116 @@
+def preprocess_image(
+    self,
+    image,
+    enhancement_level="Heavy",
+    debug=False,
+    remove_circles=True,
+    debug_save_path=None
+):
+    """
+    Apply preprocessing to improve OCR quality with focus on text clarity.
+    - remove_circles: Optionally remove option bubbles/circles.
+    - debug_save_path: If provided, saves debug images for inspection.
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    img_array = np.array(image)
+    debug_images = []
+
+    # Convert to grayscale if necessary
+    if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_array
+
+    if debug:
+        debug_images.append(("Grayscale", Image.fromarray(gray)))
+
+    # Improved dark mode detection and inversion
+    mean_val = np.mean(gray)
+    if mean_val < 110:  # Lower threshold for very dark backgrounds
+        gray = cv2.bitwise_not(gray)
+        if debug:
+            debug_images.append(("Inverted", Image.fromarray(gray)))
+
+    # Optional: Remove option circles (MCQ bubbles)
+    if remove_circles:
+        try:
+            img_no_circles = gray.copy()
+            circles_found = False
+            # Try multiple parameter sets for HoughCircles
+            for params in [
+                (1, 20, 50, 30, 8, 25),
+                (1, 20, 30, 20, 5, 30),
+                (1.5, 30, 100, 25, 10, 20)
+            ]:
+                circles = cv2.HoughCircles(
+                    gray, cv2.HOUGH_GRADIENT, *params
+                )
+                if circles is not None:
+                    circles = np.uint16(np.around(circles))
+                    for x, y, r in circles[0, :]:
+                        cv2.circle(img_no_circles, (x, y), r + 2, 255, -1)
+                    circles_found = True
+                    if debug:
+                        debug_images.append(("Circles Removed", Image.fromarray(img_no_circles)))
+                    break
+            if circles_found:
+                gray = img_no_circles
+        except Exception as e:
+            print(f"Circle removal failed: {e}")
+
+    # Adaptive resizing: scale up small images (max 4x, max 3500px)
+    max_dim = max(gray.shape)
+    scale = min(4.0, 3500 / max_dim)
+    if scale > 1.0:
+        gray = cv2.resize(gray, (int(gray.shape[1] * scale), int(gray.shape[0] * scale)), interpolation=cv2.INTER_CUBIC)
+        if debug:
+            debug_images.append(("Resized", Image.fromarray(gray)))
+
+    # Denoising: strong noise removal but preserve edges
+    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    if debug:
+        debug_images.append(("Denoised", Image.fromarray(denoised)))
+
+    # Ensure image is 2D and uint8 before CLAHE
+    if len(denoised.shape) == 3:
+        denoised = cv2.cvtColor(denoised, cv2.COLOR_BGR2GRAY)
+    if denoised.dtype != np.uint8:
+        denoised = denoised.astype(np.uint8)
+    # Contrast enhancement: CLAHE with flexible clipLimit
+    clahe = cv2.createCLAHE(clipLimit=2.5 if enhancement_level == "Heavy" else 1.5, tileGridSize=(8, 8))
+    contrasted = clahe.apply(denoised)
+    if debug:
+        debug_images.append(("Contrasted", Image.fromarray(contrasted)))
+
+    # Final binarization and morphology
+    if enhancement_level == "Light":
+        _, result = cv2.threshold(contrasted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    elif enhancement_level == "Medium":
+        binary = cv2.adaptiveThreshold(contrasted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 11, 2)
+        kernel = np.ones((1, 1), np.uint8)
+        result = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    elif enhancement_level == "Heavy":
+        _, binary = cv2.threshold(contrasted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Stronger morphology for tough cases
+        kernel = np.ones((2, 2), np.uint8)
+        result = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    else:
+        # Default to just contrasted image
+        result = contrasted
+
+    if debug:
+        debug_images.append(("Final", Image.fromarray(result)))
+        # Optionally save debug images for inspection
+        if debug_save_path:
+            for name, img in debug_images:
+                img.save(f"{debug_save_path}_{name}.png")
+
+    return Image.fromarray(result)
+
 import os
 import time
 import tkinter as tk
@@ -13,6 +126,7 @@ from docx import Document
 from docx.shared import Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from textblob import TextBlob
 import io
 import pytesseract
 import concurrent.futures
@@ -38,6 +152,20 @@ def increment_version(version_str=VERSION, level="patch"):
         return f"{major}.{minor + 1}.0"
     else:  # patch
         return f"{major}.{minor}.{patch + 1}"
+
+def clean_option_text(text):
+    # Ensure re and TextBlob are imported at the top of the file
+    # Remove leading non-alphanumeric characters and whitespace
+    cleaned = re.sub(r"^[^a-zA-Z0-9]+", "", text).strip()
+    # Use TextBlob to correct spelling (only if length > 2 and text is not empty)
+    if cleaned and len(cleaned.split()) > 0:
+        try:
+            # Ensure TextBlob is available
+            corrected = str(TextBlob(cleaned).correct())
+            return corrected
+        except Exception: # Broad exception, consider logging or being more specific
+            return cleaned # Return original cleaned text on TextBlob error
+    return cleaned # Return cleaned text if not processed by TextBlob (e.g. too short or empty)
 
 # Configuration file
 CONFIG_FILE = os.path.expanduser("~/.lmstudio_config.ini")
@@ -519,6 +647,275 @@ class BatchProcessor:
         )
         self.stop_button.pack(side=tk.LEFT, padx=5)
         
+        # Add OCR single-image button
+        self.ocr_single_button = tk.Button(
+            control_frame,
+            text="Run OCR on Selected Image",
+            command=self.run_ocr_on_single_image
+        )
+        self.ocr_single_button.pack(side=tk.LEFT, padx=5)
+        
+        # Add Quit button
+        self.quit_button = tk.Button(
+            control_frame,
+            text="Quit",
+            command=self.quit_application
+        )
+        self.quit_button.pack(side=tk.RIGHT, padx=5)
+        
+        # Progress frame
+        progress_frame = tk.Frame(self.master)
+        progress_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        tk.Label(progress_frame, text="Progress:").pack(anchor=tk.W)
+        
+        self.progress_var = tk.StringVar(value="Ready")
+        tk.Label(progress_frame, textvariable=self.progress_var).pack(anchor=tk.W)
+        
+        self.progress_bar = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, length=100, mode='determinate')
+        self.progress_bar.pack(fill=tk.X, pady=5)
+
+    def run_ocr_on_single_image(self):
+        """Minimal, robust OCR runner for a single image with GUI feedback."""
+        from tkinter import filedialog, messagebox
+        import traceback
+        try:
+            file_path = filedialog.askopenfilename(
+                title="Select an image for OCR",
+                filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff"), ("All files", "*.*")]
+            )
+            if not file_path:
+                return
+            self.master.config(cursor="wait")
+            self.master.update()
+            try:
+                text = self.perform_ocr(file_path)
+                if not text.strip():
+                    message = "No text detected by OCR."
+                else:
+                    message = text
+                messagebox.showinfo("OCR Result", message)
+            except Exception as e:
+                tb = traceback.format_exc()
+                messagebox.showerror("OCR Error", f"Error during OCR:\n{e}\n\n{tb}")
+        finally:
+            self.master.config(cursor="")
+            self.master.update()
+
+        """Minimal, robust OCR runner for a single image with GUI feedback."""
+        from tkinter import filedialog, messagebox
+        import traceback
+        try:
+            file_path = filedialog.askopenfilename(
+                title="Select an image for OCR",
+                filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff"), ("All files", "*.*")]
+            )
+            if not file_path:
+                return
+            self.master.config(cursor="wait")
+            self.master.update()
+            try:
+                text = self.perform_ocr(file_path)
+                if not text.strip():
+                    message = "No text detected by OCR."
+                else:
+                    message = text
+                messagebox.showinfo("OCR Result", message)
+            except Exception as e:
+                tb = traceback.format_exc()
+                messagebox.showerror("OCR Error", f"Error during OCR:\n{e}\n\n{tb}")
+        finally:
+            self.master.config(cursor="")
+            self.master.update()
+        # Top frame for folder selection
+        folder_frame = tk.Frame(self.master)
+        folder_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        tk.Label(folder_frame, text="Folder:").pack(side=tk.LEFT)
+        
+        self.folder_var = tk.StringVar()
+        folder_entry = tk.Entry(folder_frame, textvariable=self.folder_var, width=50)
+        folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        browse_button = tk.Button(folder_frame, text="Browse", command=self.browse_folder)
+        browse_button.pack(side=tk.LEFT, padx=5)
+        
+        # Version and about button
+        about_button = tk.Button(folder_frame, text="About", command=self.show_about_info)
+        about_button.pack(side=tk.LEFT, padx=5)
+        
+        # OCR settings frame
+        ocr_frame = tk.Frame(self.master)
+        ocr_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Tesseract path setting
+        tesseract_frame = tk.Frame(ocr_frame)
+        tesseract_frame.pack(fill=tk.X, pady=2)
+        tk.Label(tesseract_frame, text="Tesseract Path:").pack(side=tk.LEFT)
+        self.tesseract_var = tk.StringVar(value=self.config['Settings']['tesseract_path'])
+        tesseract_entry = tk.Entry(tesseract_frame, textvariable=self.tesseract_var, width=40)
+        tesseract_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        # Add help button for Tesseract
+        help_button = tk.Button(tesseract_frame, text="?", command=self.show_tesseract_instructions, width=2)
+        help_button.pack(side=tk.LEFT, padx=2)
+        
+        # Test OCR button
+        test_button = tk.Button(tesseract_frame, text="Test OCR", command=self.test_ocr)
+        test_button.pack(side=tk.LEFT, padx=5)
+        
+        # Use OCR checkbox
+        self.use_ocr_var = tk.BooleanVar(value=self.config['Settings']['use_ocr'].lower() == 'true')
+        ocr_cb = tk.Checkbutton(tesseract_frame, text="Use OCR", variable=self.use_ocr_var)
+        ocr_cb.pack(side=tk.LEFT, padx=5)
+        
+        # OCR Advanced settings
+        ocr_adv_frame = tk.Frame(ocr_frame)
+        ocr_adv_frame.pack(fill=tk.X, pady=2)
+        
+        # OCR Enhancement Level
+        tk.Label(ocr_adv_frame, text="Enhancement:").pack(side=tk.LEFT)
+        self.ocr_enhance_var = tk.StringVar(value="Medium")
+        enhance_combo = ttk.Combobox(ocr_adv_frame, textvariable=self.ocr_enhance_var, 
+                                   values=["None", "Light", "Medium", "Heavy", "Adaptive", "Super"], 
+                                   width=10, state="readonly")
+        enhance_combo.pack(side=tk.LEFT, padx=5)
+        
+        # OCR Page Segmentation Mode
+        tk.Label(ocr_adv_frame, text="Layout:").pack(side=tk.LEFT)
+        self.psm_var = tk.StringVar(value="Auto")
+        psm_combo = ttk.Combobox(ocr_adv_frame, textvariable=self.psm_var, 
+                                values=["Auto", "Single Block", "Single Column", "Single Line", "Single Word", "Sparse Text"], 
+                                width=12, state="readonly")
+        psm_combo.pack(side=tk.LEFT, padx=5)
+        
+        # OCR Engine Mode
+        tk.Label(ocr_adv_frame, text="Engine:").pack(side=tk.LEFT)
+        self.oem_var = tk.StringVar(value="Default")
+        oem_combo = ttk.Combobox(ocr_adv_frame, textvariable=self.oem_var, 
+                               values=["Legacy", "Neural", "Both", "Default"], 
+                               width=8, state="readonly")
+        oem_combo.pack(side=tk.LEFT, padx=5)
+        
+        # OCR Language
+        tk.Label(ocr_adv_frame, text="Language:").pack(side=tk.LEFT)
+        self.lang_var = tk.StringVar(value="eng")
+        lang_combo = ttk.Combobox(ocr_adv_frame, textvariable=self.lang_var, 
+                                values=["eng", "eng+math", "eng+equ"], 
+                                width=8, state="readonly")
+        lang_combo.pack(side=tk.LEFT, padx=5)
+        
+        # Show preprocessing checkbox
+        self.show_preprocess_var = tk.BooleanVar(value=False)
+        preprocess_cb = tk.Checkbutton(ocr_adv_frame, text="Show Preprocessing", variable=self.show_preprocess_var)
+        preprocess_cb.pack(side=tk.LEFT, padx=5)
+        
+        # API settings frame
+        api_frame = tk.Frame(self.master)
+        api_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Model selection
+        model_frame = tk.Frame(api_frame)
+        model_frame.pack(fill=tk.X, pady=2)
+        tk.Label(model_frame, text="Model:").pack(side=tk.LEFT)
+        self.model_var = tk.StringVar(value=self.config['API']['model'])
+        model_entry = tk.Entry(model_frame, textvariable=self.model_var, width=30)
+        model_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Temperature setting
+        temp_frame = tk.Frame(api_frame)
+        temp_frame.pack(fill=tk.X, pady=2)
+        tk.Label(temp_frame, text="Temperature:").pack(side=tk.LEFT)
+        self.temp_var = tk.StringVar(value=self.config['API']['temperature'])
+        temp_entry = tk.Entry(temp_frame, textvariable=self.temp_var, width=5)
+        temp_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Max tokens setting
+        tokens_frame = tk.Frame(api_frame)
+        tokens_frame.pack(fill=tk.X, pady=2)
+        tk.Label(tokens_frame, text="Max Tokens:").pack(side=tk.LEFT)
+        self.tokens_var = tk.StringVar(value=self.config['API']['max_tokens'])
+        tokens_entry = tk.Entry(tokens_frame, textvariable=self.tokens_var, width=5)
+        tokens_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Timeout setting
+        timeout_frame = tk.Frame(api_frame)
+        timeout_frame.pack(fill=tk.X, pady=2)
+        tk.Label(timeout_frame, text="Timeout (sec):").pack(side=tk.LEFT)
+        self.timeout_var = tk.StringVar(value=self.config['API']['timeout'])
+        timeout_entry = tk.Entry(timeout_frame, textvariable=self.timeout_var, width=5)
+        timeout_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Max retries setting
+        retry_frame = tk.Frame(api_frame)
+        retry_frame.pack(fill=tk.X, pady=2)
+        tk.Label(retry_frame, text="Max Retries:").pack(side=tk.LEFT)
+        self.retry_var = tk.StringVar(value=self.config['API']['max_retries'])
+        retry_entry = tk.Entry(retry_frame, textvariable=self.retry_var, width=2)
+        retry_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Vision model checkbox
+        vision_frame = tk.Frame(api_frame)
+        vision_frame.pack(fill=tk.X, pady=2)
+        self.vision_var = tk.BooleanVar(value=False)
+        vision_cb = tk.Checkbutton(vision_frame, text="Model has vision capabilities", variable=self.vision_var)
+        vision_cb.pack(side=tk.LEFT, padx=5)
+        
+        # Frame for file list
+        files_frame = tk.Frame(self.master)
+        files_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        tk.Label(files_frame, text="Image files to process:").pack(anchor=tk.W)
+        
+        # Create a frame with scrollbars for the file list
+        file_list_frame = tk.Frame(files_frame)
+        file_list_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Add scrollbars to the file list
+        scrollbar_y = tk.Scrollbar(file_list_frame)
+        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        scrollbar_x = tk.Scrollbar(file_list_frame, orient=tk.HORIZONTAL)
+        scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        self.file_listbox = tk.Listbox(
+            file_list_frame,
+            selectmode=tk.EXTENDED,
+            yscrollcommand=scrollbar_y.set,
+            xscrollcommand=scrollbar_x.set
+        )
+        self.file_listbox.pack(fill=tk.BOTH, expand=True)
+        
+        scrollbar_y.config(command=self.file_listbox.yview)
+        scrollbar_x.config(command=self.file_listbox.xview)
+        
+        # Control buttons
+        control_frame = tk.Frame(self.master)
+        control_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        self.process_button = tk.Button(
+            control_frame, 
+            text="Process & Create Combined Doc", 
+            command=self.start_processing
+        )
+        self.process_button.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_button = tk.Button(
+            control_frame, 
+            text="Stop", 
+            command=self.stop_processing_thread,
+            state=tk.DISABLED
+        )
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+        
+        # Add OCR single-image button
+        self.ocr_single_button = tk.Button(
+            control_frame,
+            text="Run OCR on Selected Image",
+            command=self.run_ocr_on_single_image
+        )
+        self.ocr_single_button.pack(side=tk.LEFT, padx=5)
+
         # Add Quit button
         self.quit_button = tk.Button(
             control_frame,
@@ -814,10 +1211,6 @@ class BatchProcessor:
                 try:
                     # Configure OCR parameters
                     config = f'--oem {oem} --psm {psm} -l {language} -c preserve_interword_spaces=1 -c tessedit_do_invert=0'
-                    
-                    # Add additional configeration for improved accuracy
-                    additional_config = ' -c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,?!()[]{}:;\'"_-+=/\\ " -c textord_heavy_nr=1 -c textord_min_linesize=2'
-                    config += additional_config
                     
                     # For dark mode, try with and without inversion
                     if preproc_name in ["Dark Mode", "Inverted"]:
@@ -1463,12 +1856,10 @@ class BatchProcessor:
         # Add close button
         tk.Button(preview_window, text="Close", command=preview_window.destroy).pack(pady=10)
     
-    def format_question_options(self, text):
-        """Format OCR text to ensure it follows the Question/Options format with improved cleaning."""
-        # First, clean up common OCR errors
-        clean_text = text
-        
-        # Replace common OCR errors
+    
+
+
+    def format_question_options(self, clean_text):
         replacements = {
             "0ption": "Option",
             "0ptions": "Options",
@@ -1486,175 +1877,171 @@ class BatchProcessor:
             "(C)": "C)",
             "(D)": "D)",
         }
-        
         for error, correction in replacements.items():
             clean_text = clean_text.replace(error, correction)
-        
         # Remove selection circles and bullet points from the text
-        # They typically appear as O, ●, •, ○, etc.
         clean_text = re.sub(r'[○●•◉⦿⚪⚫]|[\(\[]?\s*[Oo]\s*[\)\]]?\s*', '', clean_text)
-        
         # First, try to identify a question directly
-        # Look for any text ending with a question mark
         question_match = re.search(r'([^.!?]+\?)', clean_text)
         if question_match:
             question_text = question_match.group(1).strip()
-            # Remove the question from the text for processing options
             remaining_text = clean_text.replace(question_text, "", 1)
         else:
-            # No clear question with "?" found - look for text before options
             lines = clean_text.split('\n')
             question_text = ""
             remaining_text = clean_text
-            
-            # Try to find where options start - improved patterns
             option_start_index = -1
             for i, line in enumerate(lines):
-                # Match option identifiers more broadly, accounting for circle symbols or OCR mistakes
-                if (re.search(r'^\s*A[\.\:\)\s]', line) or  # A. or A: or A) 
-                    re.search(r'^\s*[Oo]?ption\s*A[\.\:\s]', line, re.IGNORECASE) or  # Option A: or option A.
-                    re.search(r'^\s*A$', line)):  # Just A on a line
+                if (re.search(r'^\s*A[\.\:\)\s]', line) or
+                    re.search(r'^\s*[Oo]?ption\s*A[\.\:\s]', line, re.IGNORECASE) or
+                    re.search(r'^\s*A$', line)):
                     option_start_index = i
                     break
-            
             if option_start_index > 0:
-                # All text before options is probably the question
                 question_text = " ".join(lines[:option_start_index]).strip()
                 remaining_text = "\n".join(lines[option_start_index:])
-            else:
-                # Can't clearly identify question/options structure
-                # Assume first line is question
-                question_text = lines[0] if lines else "Unknown question"
-                remaining_text = "\n".join(lines[1:]) if len(lines) > 1 else ""
-        
-        # Make sure question text ends with a question mark if it doesn't already
         if question_text and not question_text.endswith('?'):
             question_text = question_text + '?'
-
-        # Process options with improved regex patterns
+        question_text = clean_option_text(question_text)
         options = {'A': '', 'B': '', 'C': '', 'D': ''}
-        
-        # Look for each option with more robust pattern matching
+        option_lines = []
+        bullet_regex = re.compile(r'^[\s\u2022\u2023\u25E6\u2043\u2219\*\-]+(.+)$')
+        lines = [l.strip() for l in remaining_text.split('\n') if l.strip()]
+        used_indices = set()
         for option in options.keys():
-            # Try different patterns for this option - improved patterns to handle selection circles
             patterns = [
-                # Standard option formats
-                fr'(?:^|\n)\s*{option}[\.\:\)\s]\s*(.*?)(?=(?:\n\s*[B-D][\.\:\)\s])|$)',  # A. text
-                
-                # Option word formats
-                fr'(?:^|\n)\s*[Oo]ption\s+{option}[\.\:\s]\s*(.*?)(?=(?:\n\s*[Oo]ption\s+[B-D])|$)',  # Option A: text
-                
-                # Options with colon/word
-                fr'(?:^|\n)\s*[Oo]ptions:\s*{option}[\.\:\s]\s*(.*?)(?=(?:\n\s*[Oo]ptions:\s*[B-D])|$)', # Options: A: text
+                fr'(?:^|\n)\s*{option}[\.\:\)\s]\s*(.*?)(?=(?:\n\s*[B-D][\.\:\)\s])|$)',
+                fr'(?:^|\n)\s*[Oo]ption\s+{option}[\.\:\s]\s*(.*?)(?=(?:\n\s*[Oo]ption\s+[B-D])|$)',
+                fr'(?:^|\n)\s*[Oo]ptions:\s*{option}[\.\:\s]\s*(.*?)(?=(?:\n\s*[Oo]ptions:\s*[B-D])|$)',
             ]
-            
-            for pattern in patterns:
-                match = re.search(pattern, remaining_text, re.IGNORECASE | re.DOTALL)
-                if match:
-                    options[option] = match.group(1).strip()
+            for i, line in enumerate(lines):
+                for pattern in patterns:
+                    match = re.match(pattern, line, re.IGNORECASE | re.DOTALL)
+                    if match:
+                        options[option] = match.group(1).strip()
+                        used_indices.add(i)
+                        break
+                if options[option]:
                     break
-        
-        # Build the formatted text
+        bullet_lines = [i for i, l in enumerate(lines) if bullet_regex.match(l) and i not in used_indices]
+        for idx, option in zip(bullet_lines, options.keys()):
+            bullet_match = bullet_regex.match(lines[idx])
+            if bullet_match:
+                options[option] = bullet_match.group(1).strip()
+        empty_options = [k for k, v in options.items() if not v]
+        used_lines = set(used_indices) | set(bullet_lines)
+        candidate_lines = [l for i, l in enumerate(lines) if i not in used_lines]
+        for option, line in zip(empty_options, candidate_lines):
+            options[option] = line.strip()
+        for option in options:
+            options[option] = clean_option_text(options[option])
         result = f"Question: {question_text.strip()}\n\n"
-        
-        # Add each option, even if empty
         for option, text in options.items():
             result += f"Option {option}: {text if text else '[Option text not detected]'}\n"
-        
         return result
-    
+    def show_about_info(self):
+        import tkinter.messagebox # Local import for safety
+        # Ensure VERSION is defined, e.g., VERSION = "1.0.0" at the top of the file
+        tkinter.messagebox.showinfo("About", f"LM Studio Batch Processor v{VERSION}\n\nCreated by Simon Andrews")
+
     def process_files(self, total_files):
         """Process all image files in the queue."""
         processed_count = 0
-        
-        endpoint = self.config['API']['endpoint']
-        model = self.config['API']['model']
+        # Ensure os and time are imported at the top of the file.
+        # Ensure self.config, self.vision_var, self.use_ocr_var, self.results_queue, 
+        # self.processing_queue, self.ocr_results, self.stop_processing are initialized.
+
+        endpoint = self.config['API'].get('endpoint', 'http://localhost:1234/v1/chat/completions')
+        model = self.config['API'].get('model', 'gemma-3-12b-instruct')
         has_vision = self.vision_var.get()
         use_ocr = self.use_ocr_var.get()
         
         try:
-            temperature = float(self.config['API']['temperature'])
+            temperature = float(self.config['API'].get('temperature', '0.7'))
         except ValueError:
             temperature = 0.7
             
         try:
-            max_tokens = int(self.config['API']['max_tokens'])
+            max_tokens = int(self.config['API'].get('max_tokens', '-1'))
         except ValueError:
             max_tokens = -1
             
         try:
-            timeout = int(self.config['API']['timeout'])
+            timeout = int(self.config['API'].get('timeout', '300'))
         except ValueError:
             timeout = 300
             
         try:
-            max_retries = int(self.config['API']['max_retries'])
+            max_retries = int(self.config['API'].get('max_retries', '2'))
         except ValueError:
             max_retries = 2
         
         while not self.processing_queue.empty() and not self.stop_processing:
             try:
-                file_path = self.processing_queue.get()
+                file_path = self.processing_queue.get_nowait()
                 file_name = os.path.basename(file_path)
-                
-                # Update status
-                self.results_queue.put(("status", f"Processing {file_name} with API..."))
-                
+
+                self.results_queue.put(("status", f"Processing {file_name}..."))
+
                 content = ""
                 ocr_text = ""
-                
-                # If using OCR, check if we already have the OCR result
+
                 if use_ocr:
-                    # Check if OCR has already been completed for this file
                     ocr_text = self.ocr_results.get(file_path, "")
-                    
-                    # If not, we'll wait a bit but continue anyway with a message
-                    if not ocr_text:
-                        # Check if it's still processing
-                        await_time = 0
-                        max_wait = 3  # Wait at most 3 seconds for OCR
-                        while not ocr_text and await_time < max_wait:
-                            time.sleep(1)
-                            await_time += 1
+                    if not ocr_text and getattr(self, 'ocr_thread_pool', None):  # Check if threaded OCR might be running
+                        await_time = 0.0
+                        max_ocr_wait = 2.0  # seconds
+                        sleep_interval = 0.2
+                        while not ocr_text and await_time < max_ocr_wait and not self.stop_processing:
+                            time.sleep(sleep_interval)
+                            await_time += sleep_interval
                             ocr_text = self.ocr_results.get(file_path, "")
-                        
-                        if not ocr_text:
-                            self.results_queue.put(("status", f"OCR still in progress for {file_name}, proceeding with API call..."))
-                            ocr_text = "OCR in progress. Results will be merged later."
-                
-                # Different handling based on vision capability and OCR
-                if has_vision and not use_ocr:
-                    # Convert image to base64 for API - vision mode
+
+                    if ocr_text:
+                        # Ensure format_question_options handles potential errors gracefully
+                        try:
+                            formatted_ocr = self.format_question_options(ocr_text)
+                            prompt = f"Analyze the following OCR text from an image named '{file_name}'. Extract the main question and its multiple-choice options (A, B, C, D). Format the output clearly.\n\nOCR Text:\n{formatted_ocr}"
+                            content = prompt
+                        except Exception as fmt_e:
+                            self.results_queue.put(("error", f"Error formatting OCR for {file_name}: {str(fmt_e)}"))
+                            content = f"Error formatting OCR for '{file_name}'. Based on filename, provide insights."
+                    else:
+                        content = f"OCR for '{file_name}' did not yield text or was not ready. Based on the filename, can you provide insights?"
+                elif has_vision and not use_ocr:
                     try:
+                        # Ensure encode_image handles potential errors gracefully
                         image_data = self.encode_image(file_path)
-                        prompt = f"Describe this image in detail. What do you see in it?"
+                        prompt = f"This image is named '{file_name}'. Analyze the image. If it contains a question with multiple-choice options (typically A, B, C, D), please extract the full question and all its options accurately. If not, describe the image content."
                         content = f"Here is an image to analyze:\n![Image]({image_data})\n\n{prompt}"
-                    except Exception as e:
-                        self.results_queue.put(("error", f"Error encoding image {file_name}: {str(e)}"))
+                    except Exception as enc_e:
+                        self.results_queue.put(("error", f"Error encoding image {file_name}: {str(enc_e)}"))
                         processed_count += 1
                         self.results_queue.put(("progress", processed_count))
-                        continue
+                        if hasattr(self.processing_queue, 'task_done'):
+                            self.processing_queue.task_done()
+                        continue  # to next file
                 else:
-                    # Fallback if OCR failed, in progress, or not used
+                    # Fallback if OCR failed, in progress, or not used, and vision is not applicable
                     content = f"This is a prompt about an image file named '{file_name}'. Based on the filename, can you provide any insights or information that might be relevant?"
-                
+
                 # Make request to LM Studio API with retry logic
                 response = None
                 retries = 0
                 last_error = None
-                
+
                 while response is None and retries <= max_retries:
                     if retries > 0:
                         retry_delay = retries * 2  # Progressive backoff
                         self.results_queue.put(("status", f"Retry {retries}/{max_retries} for {file_name} (waiting {retry_delay}s)..."))
                         time.sleep(retry_delay)
-                    
+
                     try:
                         response = self.get_lmstudio_response(
-                            endpoint, 
-                            model, 
-                            content, 
-                            temperature, 
+                            endpoint,
+                            model,
+                            content,
+                            temperature,
                             max_tokens,
                             timeout
                         )
@@ -1662,7 +2049,7 @@ class BatchProcessor:
                         last_error = str(e)
                         self.results_queue.put(("status", f"Error: {last_error}. Retrying..."))
                         retries += 1
-                
+
                 if response:
                     # Store the API result now, we'll merge with final OCR result when creating document
                     self.results_queue.put(("api_result", (file_path, response)))
@@ -1677,14 +2064,15 @@ class BatchProcessor:
                     self.results_queue.put(("error", error_msg))
                     processed_count += 1
                     self.results_queue.put(("progress", processed_count))
-                
+
                 # Small delay to avoid overwhelming the API
                 time.sleep(1)
-                
             except Exception as e:
                 self.results_queue.put(("error", f"Error processing {os.path.basename(file_path)}: {str(e)}"))
                 processed_count += 1
                 self.results_queue.put(("progress", processed_count))
+
+
         
         # Processing complete
         if not self.stop_processing:

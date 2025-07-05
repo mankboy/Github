@@ -11,6 +11,8 @@ from db_operations import OCRDatabase # Added for database operations
 import textwrap
 import sys
 import functools
+# --- Import AnythingLLM document fetcher for RAG enforcement ---
+from getfilelist import fetch_documents, BASE_URL, API_KEY
 
 # --- Configuration (User might need to set this) ---
 # Example: pytesseract.pytesseract.tesseract_cmd = r'/opt/homebrew/bin/tesseract'
@@ -40,6 +42,7 @@ def load_config():
 import requests
 import time
 import threading
+from TextRedirector import TextRedirector
 
 class OCRApp:
     def query_lms_batch_with_tab_switch(self):
@@ -62,7 +65,7 @@ class OCRApp:
         sys.stderr = self.stderr_redirector
         def safe_gui_call(func, *args, **kwargs):
             self.master.after(0, lambda: func(*args, **kwargs))
-            
+
         print(f"[DEBUG] sys.stdout in worker: {type(sys.stdout)} {repr(sys.stdout)}", flush=True)
         safe_gui_call(self.query_lms_button.config, state=tk.DISABLED)
         selection = self.questions_listbox.curselection()
@@ -80,75 +83,93 @@ class OCRApp:
             safe_gui_call(self.query_lms_button.config, state=tk.NORMAL)
             return
         safe_gui_call(self.log_status, f"Querying LMS for {len(questions)} selected question(s)...")
+        # --- Limit queries to available RAG documents ---
         try:
-            for idx, q in enumerate(questions, 1):
-                qid = q['id']
-                qtext = q['question_text']
-                print(f"[API] ({idx}/{len(questions)}) Starting LLM query for question id={qid}", flush=True)
-                if self.db.has_llm_results(qid):
-                    print(f"[API] ({idx}/{len(questions)}) Skipping question id={qid} (already has LLM results)", flush=True)
-                    safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] Skipping question id={qid} (already has LLM results)")
-                    continue
-                options = self.db.get_options_for_question(qid)
-                if not options:
-                    print(f"[API] ({idx}/{len(questions)}) Skipping question id={qid} (no options found)", flush=True)
-                    safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] Skipping question id={qid} (no options found)")
-                    continue
-                prompt = self._build_llm_prompt(qtext, options)
-                print(f"[PROMPT] Prompt for question id={qid} (idx={idx}):\n{prompt}", flush=True)
-                payload = {
-                    "model": "gemma-3-12b-instruct",
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ]
-                }
-                print(f"[HTTP] Sending payload for question id={qid}: {json.dumps(payload, indent=2)}", flush=True)
+            documents = fetch_documents(BASE_URL, API_KEY)
+            available_doc_ids = [doc.get('id') for doc in documents if doc.get('id')]
+            print(f"[RAG] Limiting queries to available document IDs: {available_doc_ids}", flush=True)
+        except Exception as e:
+            print(f"[RAG] Failed to fetch available RAG documents: {e}", flush=True)
+            available_doc_ids = []
+
+        for idx, q in enumerate(questions, 1):
+            qid = q['id']
+            qtext = q['question_text']
+            print(f"[API] ({idx}/{len(questions)}) Starting LLM query for question id={qid}", flush=True)
+            if self.db.has_llm_results(qid):
+                print(f"[API] ({idx}/{len(questions)}) Skipping question id={qid} (already has LLM results)", flush=True)
+                safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] Skipping question id={qid} (already has LLM results)")
+                continue
+            options = self.db.get_options_for_question(qid)
+            if not options:
+                print(f"[API] ({idx}/{len(questions)}) Skipping question id={qid} (no options found)", flush=True)
+                safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] Skipping question id={qid} (no options found)")
+                continue
+            prompt = self._build_llm_prompt(qtext, options)
+            print(f"[PROMPT] Prompt for question id={qid} (idx={idx}):\n{prompt}", flush=True)
+            payload = {
+                "model": "gemma-3-12b-instruct",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "document_ids": available_doc_ids
+            }
+            print(f"[HTTP] Sending payload for question id={qid}: {json.dumps(payload, indent=2)}", flush=True)
+            try:
+                start_time = time.time()
+                headers = {"Authorization": "Bearer P5G5T5W-8914F8J-M9B40WZ-SH08PNA"}
+                resp = requests.post(
+                    url = "http://127.0.0.1:8000/v1/openai/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=60
+                )
+                elapsed = time.time() - start_time
+                print(f"[HTTP] Response status: {resp.status_code} in {elapsed:.2f}s", flush=True)
+                resp.raise_for_status()
+                print(f"[HTTP] Raw response text: {resp.text}", flush=True)
                 try:
-                    start_time = time.time()
-                    resp = requests.post("http://127.0.0.1:1234/v1/chat/completions", json=payload, timeout=60)
-                    elapsed = time.time() - start_time
-                    print(f"[HTTP] Response status: {resp.status_code} in {elapsed:.2f}s", flush=True)
-                    resp.raise_for_status()
-                    print(f"[API] ({idx}/{len(questions)}) Success for question id={qid}", flush=True)
-                    try:
-                        # Print full LLM response content to log (matches Windsurf terminal)
-                        content = resp.json().get('choices', [{}])[0].get('message', {}).get('content', '')
-                        print("\n=== FULL LLM RESPONSE CONTENT ===\n" + content + "\n===============================\n", flush=True)
-                        answer, justification, explanations, references = self._parse_llm_response(resp.json())
-                        print(f"[DB] Updating DB for question id={qid}", flush=True)
-                        self.db.update_llm_results(qid, answer, justification, explanations, references)
-                        self.question_data[idx-1]['llm_answer'] = answer
-                        self.question_data[idx-1]['llm_justification'] = justification
-                        self.question_data[idx-1]['llm_explanations'] = explanations
-                        for i, ref in enumerate(references):
-                            self.question_data[idx-1][f'src{i+1}_filename'] = ref.get('filename', '')
-                            self.question_data[idx-1][f'src{i+1}_section'] = ref.get('section', '')
-                            self.question_data[idx-1][f'src{i+1}_page'] = ref.get('page', '')
-                        self.question_data[idx-1]['llm_references'] = references
-                        safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] LLM results stored for question id={qid}")
-                    except Exception as e:
-                        print(f"[API] ({idx}/{len(questions)}) FAILED to parse LLM response for question id={qid}: {e}\n{traceback.format_exc()}", flush=True)
-                        safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] LLM response parsing failed for id={qid}: {e}")
-                        self.question_data[idx-1][f'src{i+1}_filename'] = ref.get('filename', '')
-                        self.question_data[idx-1][f'src{i+1}_section'] = ref.get('section', '')
-                        self.question_data[idx-1][f'src{i+1}_page'] = ref.get('page', '')
-                    self.question_data[idx-1]['llm_references'] = references
-                    safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] LLM results stored for question id={qid}")
-                except Exception as e:
-                    print(f"[API] ({idx}/{len(questions)}) FAILED for question id={qid}: {e}\n{traceback.format_exc()}", flush=True)
-                    safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] LLM query failed for id={qid}: {e}")
-                    continue
-                time.sleep(1)
-            safe_gui_call(messagebox.showinfo, "Query LMS", f"LLM processing complete. {len(questions)} question(s) processed.")
-            print(f"[BATCH] Query LMS batch finished at {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
-        finally:
-            safe_gui_call(self.query_lms_button.config, state=tk.NORMAL)
-            safe_gui_call(self.refresh_questions_list)
-            # Reload question_data and refresh details pane so UI shows latest LLM results
-            self.question_data = self.db.get_all_questions()
-            selection = self.questions_listbox.curselection()
-            if selection:
-                safe_gui_call(self.on_question_select, None)
+                    data = resp.json()
+                    print(f"[HTTP] Decoded JSON: {json.dumps(data, indent=2)}", flush=True)
+                    content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    if not content:
+                        print(f"[API] ({idx}/{len(questions)}) LLM response missing content.", flush=True)
+                        safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] LLM response missing content.")
+                    else:
+                        print(f"[API] ({idx}/{len(questions)}) LLM response content: {content}", flush=True)
+                        try:
+                            answer, justification, explanations, references = self._parse_llm_response(data)
+                            print(f"[DB] Updating DB for question id={qid}", flush=True)
+                            self.db.update_llm_results(qid, answer, justification, explanations, references)
+                            self.question_data[idx-1]['llm_answer'] = answer
+                            self.question_data[idx-1]['llm_justification'] = justification
+                            self.question_data[idx-1]['llm_explanations'] = explanations
+                            for i, ref in enumerate(references):
+                                self.question_data[idx-1][f'src{i+1}_filename'] = ref.get('filename', '')
+                                self.question_data[idx-1][f'src{i+1}_section'] = ref.get('section', '')
+                                self.question_data[idx-1][f'src{i+1}_page'] = ref.get('page', '')
+                            self.question_data[idx-1]['llm_references'] = references
+                            safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] LLM results stored for question id={qid}")
+                        except Exception as e:
+                            print(f"[API] ({idx}/{len(questions)}) FAILED to parse LLM response for question id={qid}: {e}\n{traceback.format_exc()}", flush=True)
+                            safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] LLM response parsing failed for id={qid}: {e}")
+                except Exception as json_e:
+                    print(f"[API] ({idx}/{len(questions)}) JSON decode or response parse error: {json_e}", flush=True)
+                    print(f"[API] ({idx}/{len(questions)}) Raw response text for debugging: {resp.text}", flush=True)
+                    safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] JSON decode or response parse error: {json_e}")
+            except Exception as e:
+                print(f"[API] ({idx}/{len(questions)}) FAILED for question id={qid}: {e}", flush=True)
+                safe_gui_call(self.log_status, f"[{idx}/{len(questions)}] FAILED for question id={qid}: {e}")
+            time.sleep(1)
+        safe_gui_call(messagebox.showinfo, "Query LMS", f"LLM processing complete. {len(questions)} question(s) processed.")
+        print(f"[BATCH] Query LMS batch finished at {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+        safe_gui_call(self.query_lms_button.config, state=tk.NORMAL)
+        safe_gui_call(self.refresh_questions_list)
+        # Reload question_data and refresh details pane so UI shows latest LLM results
+        self.question_data = self.db.get_all_questions()
+        selection = self.questions_listbox.curselection()
+        if selection:
+            safe_gui_call(self.on_question_select, None)
 
     def _build_llm_prompt(self, question_text, options):
         prompt = f"Given the following multiple choice question, provide the correct answer, a detailed justification for the correct answer, and an explanation for why each incorrect option is incorrect.\n\nQuestion: {question_text}\n"
@@ -159,11 +180,10 @@ class OCRApp:
             "Answer: <letter>\n"
             "Justification: <text>\n"
             "Explanations:\nA: <reason>\nB: <reason>\nC: <reason>\nD: <reason>\n"
-            "Source References (up to 3, from the sacomm workspace only):\n"
-            "1. Document Name: sacomm: <name>; Section: <section>; Page: <number>\n"
-            "2. Document Name: sacomm: <name>; Section: <section>; Page: <number>\n"
-            "3. Document Name: sacomm: <name>; Section: <section>; Page: <number>\n"
-            "(Always include 'sacomm:' at the start of the Document Name for each reference.)\n"
+            "Source References (up to 3):\n"
+            "1. Document Name: <name>; Section: <section>; Page: <number>\n"
+            "2. Document Name: <name>; Section: <section>; Page: <number>\n"
+            "3. Document Name: <name>; Section: <section>; Page: <number>\n"
         )
         return prompt
 
@@ -381,6 +401,12 @@ class OCRApp:
         
         # Create the log text widget
         self.create_log_widget()
+        # Redirect stdout/stderr to the Logging tab for all threads
+        self.stdout_redirector = TextRedirector(self.log_text, "stdout")
+        self.stderr_redirector = TextRedirector(self.log_text, "stderr")
+        sys.stdout = self.stdout_redirector
+        sys.stderr = self.stderr_redirector
+
         
         # Create the start button
         self.create_start_button()

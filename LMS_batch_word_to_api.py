@@ -27,11 +27,32 @@ from datetime import datetime
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('lms_processor.log'),
-        logging.StreamHandler()
-    ]
 )
+
+logging.info('Script started.')
+
+def main():
+    try:
+        logging.info('Entering main()')
+        # --- Place your main script logic here ---
+        # For demonstration, log each major import
+        logging.info('All modules imported successfully.')
+        # If you have a GUI or batch process, log its start
+        # logging.info('Starting GUI...')
+        # logging.info('Starting batch processing...')
+        pass  # Replace with actual logic
+        logging.info('main() completed successfully.')
+    except Exception as e:
+        logging.exception('Unhandled exception in main()')
+        raise
+
+if __name__ == '__main__':
+    try:
+        main()
+        logging.info('Script finished successfully.')
+    except Exception as e:
+        logging.exception('Script terminated with an error.')
+
 logger = logging.getLogger(__name__)
 
 # Global variables
